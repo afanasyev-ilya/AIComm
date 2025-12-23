@@ -51,9 +51,6 @@ using namespace std;
 struct Args {
     std::string mode = "col"; // "col" or "row"
     int gpus = 1;
-    int N = 8; // rows of X, rows of Y
-    int K = 8; // cols of X, rows of W
-    int M = 8; // cols of W, cols of Y
     int check = 0;
 };
 
@@ -68,9 +65,6 @@ static Args parse_args(int argc, char** argv) {
         };
         if(!std::strcmp(argv[i], "--mode")) { need("--mode"); a.mode = argv[++i]; }
         else if (!std::strcmp(argv[i], "--gpus")) { need("--gpus"); a.gpus = std::atoi(argv[++i]); }
-        else if (!std::strcmp(argv[i], "--n")) { need("--n"); a.N = std::atoi(argv[++i]); }
-        else if (!std::strcmp(argv[i], "--k")) { need("--k"); a.K = std::atoi(argv[++i]); }
-        else if (!std::strcmp(argv[i], "--m")) { need("--m"); a.M = std::atoi(argv[++i]); }
         else if (!std::strcmp(argv[i], "--check")) { need("--check"); a.check = std::atoi(argv[++i]); }
         else {
             std::fprintf(stderr, "Unknown arg: %s\n", argv[i]);
@@ -121,9 +115,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    int N = args.N;
-    int K = args.K;
-    int M = args.M;
+    int size_sq = 4096;
+    int N = size_sq;
+    int K = size_sq;
+    int M = size_sq;
+
+    std::cout << N << " " << K << " " << M << std::endl;
 
     std::vector<float> hX((size_t)N * K);
     std::vector<float> hW((size_t)K * M);
@@ -190,48 +187,45 @@ int main(int argc, char** argv) {
 
         std::cout << "[status] h2d copy done" << std::endl;
 
-        // compute
-        for (int gpu_id = 0; gpu_id < ngpus; gpu_id++) {
-            std::cout << gpu_id << std::endl;
-            cudaSetDevice(gpu_data[gpu_id].dev);
-            // Y_sh = X(NxK) * W_sh(KxMsh) -> Y_sh(NxMsh)
-            cublasSgemm(
-                gpu_data[gpu_id].blas,
-                CUBLAS_OP_N, CUBLAS_OP_N,
-                N, M_shard_size, K,
-                &alpha,
-                gpu_data[gpu_id].dX, N,
-                gpu_data[gpu_id].dW, K,
-                &beta,
-                gpu_data[gpu_id].dY, N
-            );
-            std::cout << "gemm started" << std::endl;
+        for(int iter = 0; iter < 20; iter++) {
+            // compute
+            for (int gpu_id = 0; gpu_id < ngpus; gpu_id++) {
+                cudaSetDevice(gpu_data[gpu_id].dev);
+                // Y_sh = X(NxK) * W_sh(KxMsh) -> Y_sh(NxMsh)
+                cublasSgemm(
+                    gpu_data[gpu_id].blas,
+                    CUBLAS_OP_N, CUBLAS_OP_N,
+                    N, M_shard_size, K,
+                    &alpha,
+                    gpu_data[gpu_id].dX, N,
+                    gpu_data[gpu_id].dW, K,
+                    &beta,
+                    gpu_data[gpu_id].dY, N
+                );
+            }
+
+            // materealize output on all GPUS
+            ncclGroupStart();
+            for (int gpu_id = 0; gpu_id < ngpus; gpu_id++) {
+                cudaSetDevice(gpu_data[gpu_id].dev);
+                // AllGather shards into full Y on every GPU
+                ncclAllGather(
+                    gpu_data[gpu_id].dY, // send buf
+                    gpu_data[gpu_id].dY_full, // recv buf
+                    (size_t)N * M_shard_size, // send size
+                    ncclFloat, // dtype
+                    comms[gpu_id],
+                    gpu_data[gpu_id].stream
+                );
+            }
+            ncclGroupEnd();
+
+            // Sync
+            for (int gpu_id = 0; gpu_id < ngpus; gpu_id++) {
+                CHECK_CUDA(cudaSetDevice(gpu_data[gpu_id].dev));
+                CHECK_CUDA(cudaStreamSynchronize(gpu_data[gpu_id].stream));
+            } 
         }
-
-        // materealize output on all GPUS
-        CHECK_NCCL(ncclGroupStart());
-        for (int gpu_id = 0; gpu_id < ngpus; gpu_id++) {
-            std::cout << gpu_id << std::endl;
-            cudaSetDevice(gpu_data[gpu_id].dev);
-            // AllGather shards into full Y on every GPU
-            CHECK_NCCL(ncclAllGather(
-                gpu_data[gpu_id].dY, // send buf
-                gpu_data[gpu_id].dY_full, // recv buf
-                (size_t)N * M_shard_size, // send size
-                ncclFloat, // dtype
-                comms[gpu_id],
-                gpu_data[gpu_id].stream
-            ));
-        }
-        CHECK_NCCL(ncclGroupEnd());
-
-        // Sync
-        for (int gpu_id = 0; gpu_id < ngpus; gpu_id++) {
-            CHECK_CUDA(cudaSetDevice(gpu_data[gpu_id].dev));
-            CHECK_CUDA(cudaStreamSynchronize(gpu_data[gpu_id].stream));
-        } 
-
-        std::cout << "[status] compute started" << std::endl;
 
         /*if (args.check) {
             // Copy result from GPU0 and compare
