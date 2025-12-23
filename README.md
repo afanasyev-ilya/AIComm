@@ -1,13 +1,20 @@
 # AIComm
 
+### Build:
+```
+mkdir build
+cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DNCCL_ROOT=/home/i.afanasyev/nccl/build
+make
+```
 
-Runtime:
+### Runtime set up:
 ```
 export LD_LIBRARY_PATH=/home/i.afanasyev/nccl/build/lib:$LD_LIBRARY_PATH
 
 ```
 
-Profiling:
+### Profiling:
 
 Using nsys 2025.6.1+ is mandatory
 ```
