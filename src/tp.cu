@@ -157,7 +157,7 @@ int main(int argc, char** argv) {
 
         int M_shard_size = M / ngpus;
 
-        // move data for each GPU
+        // move data for each GPU, preliminary step
         for (int gpu_id = 0; gpu_id < ngpus; gpu_id++) {
             CHECK_CUDA(cudaSetDevice(gpu_data[gpu_id].dev));
 
@@ -170,7 +170,7 @@ int main(int argc, char** argv) {
             CHECK_CUDA(cudaMemcpyAsync(gpu_data[gpu_id].dX, hX.data(), (size_t)N * K * sizeof(float),
                                        cudaMemcpyHostToDevice, gpu_data[gpu_id].stream));
 
-            // W shard: columns [r*Msh, (r+1)*Msh)
+            // W shard: columns [r*Msh, (r+1)*Msh) - this should be eliminated and optimized by correct stroing of W
             int ldW_shard = M_shard_size;
             int ldW = M;
             std::vector<float> hW_shard((size_t)K * M_shard_size);
@@ -185,8 +185,7 @@ int main(int argc, char** argv) {
                         cudaMemcpyHostToDevice, gpu_data[gpu_id].stream));
         }
 
-        std::cout << "[status] h2d copy done" << std::endl;
-
+        // main compute loop, we should time that on both GPUs and assume data is already distributed
         for(int iter = 0; iter < 20; iter++) {
             // compute
             for (int gpu_id = 0; gpu_id < ngpus; gpu_id++) {
@@ -240,6 +239,8 @@ int main(int argc, char** argv) {
                 std::cout << std::endl;
             }
         }*/
+
+        // TODO free
     }
 
     cudaProfilerStop();
