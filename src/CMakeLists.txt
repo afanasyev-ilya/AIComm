@@ -1,0 +1,10 @@
+# Helper: add subdir only if it exists (so you can add pipeline_parallel later)
+function(add_optional_subdir dir)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${dir}/CMakeLists.txt")
+    add_subdirectory(${dir})
+  endif()
+endfunction()
+
+add_optional_subdir(tensor_parallel)
+add_optional_subdir(pipeline_parallel)
+add_optional_subdir(moe)
