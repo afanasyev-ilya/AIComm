@@ -11,11 +11,14 @@
 #include <cublas_v2.h>
 #include <nccl.h>
 #include <vector>
+#include <cuda_profiler_api.h>
 
 using namespace std;
 
 // nvcc -I /home/i.afanasyev/nccl/build/include/ tp.cu -L /home/i.afanasyev/nccl/build/lib/ -lcublas -lnccl -o tp_fc_nccl
 // export LD_LIBRARY_PATH=/home/i.afanasyev/nccl/build/lib/
+// for profiling
+// export PATH="/home/i.afanasyev/opt/nsys-cli/extract/opt/nvidia/nsight-systems-cli/2025.6.1/bin:$PATH"
 
 #define CHECK_CUDA(cmd) do {                                   \
   cudaError_t e = (cmd);                                       \
@@ -132,6 +135,8 @@ int main(int argc, char** argv) {
     for (int i = 0; i < ngpus; ++i)
         devs[i] = i;
 
+    std::cout << "NCCL init" << std::endl;
+
     std::vector<ncclComm_t> comms(ngpus);
     CHECK_NCCL(ncclCommInitAll(comms.data(), ngpus, devs.data()));
 
@@ -143,6 +148,8 @@ int main(int argc, char** argv) {
         CHECK_CUBLAS(cublasCreate(&gpu_data[gpu_id].blas));
         CHECK_CUBLAS(cublasSetStream(gpu_data[gpu_id].blas, gpu_data[gpu_id].stream));
     }
+
+    cudaProfilerStart();
 
     const float alpha = 1.0f, beta = 0.0f;
     if (args.mode == "col") {
@@ -200,7 +207,7 @@ int main(int argc, char** argv) {
             );
             std::cout << "gemm started" << std::endl;
         }
-        
+
         // materealize output on all GPUS
         CHECK_NCCL(ncclGroupStart());
         for (int gpu_id = 0; gpu_id < ngpus; gpu_id++) {
@@ -240,6 +247,8 @@ int main(int argc, char** argv) {
             }
         }*/
     }
+
+    cudaProfilerStop();
 
     return 0;
 }
