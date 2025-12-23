@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <nccl.h>
+#include <cuda_profiler_api.h>
 
 using namespace std;
 
@@ -26,6 +27,10 @@ using namespace std;
 // ./tp_fc_nccl --gpus 2 --n 4096 --k 4096 --m 4096 --iters 20 --warmup 5
 // ./tp_fc_nccl --gpus 1 --n 4096 --k 4096 --m 4096 --iters 20 --warmup 5
 // ./tp_fc_nccl --gpus 2 --n 256 --k 256 --m 256 --iters 50 --warmup 10 --check 1
+// Profile:
+// use custom (2026) nsys, for example via export path
+// export PATH="/home/i.afanasyev/opt/nsys-cli/extract/opt/nvidia/nsight-systems-cli/2025.6.1/bin:$PATH"
+
 
 #define CHECK_CUDA(cmd)                                              \
     do                                                               \
@@ -311,11 +316,13 @@ int main(int argc, char **argv)
     for (int i = 0; i < args.warmup; ++i)
         one_iteration();
 
+    cudaProfilerStart();
     // Timed iterations
     auto t0 = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < args.iters; ++i)
         one_iteration();
     auto t1 = std::chrono::high_resolution_clock::now();
+    cudaProfilerStop();
 
     double sec = std::chrono::duration<double>(t1 - t0).count();
     double ms_per_iter = (sec * 1000.0) / (double)args.iters;
