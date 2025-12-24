@@ -1,6 +1,5 @@
 #include "../common.cuh"
 
-
 // ---------------------- simple barrier (C++17) ----------------------
 struct Barrier
 {
@@ -180,6 +179,7 @@ struct RankCtx
     int E_total = 0;
     int B = 0;
     int d = 0;
+    int max_tokens = 0;
 
     ncclComm_t comm{};
     cudaStream_t stream{};
@@ -231,6 +231,15 @@ static void compute_exclusive_scan(const std::vector<int> &counts, std::vector<i
     offsets[0] = 0;
     for (size_t i = 0; i < counts.size(); i++)
         offsets[i + 1] = offsets[i] + counts[i];
+}
+
+__global__ void perturb_X(float *X, int n, float alpha, float beta)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n)
+    {
+        X[i] = X[i] * alpha + beta;
+    }
 }
 
 static void rank_thread(RankCtx *ctx,
@@ -294,206 +303,221 @@ static void rank_thread(RankCtx *ctx,
 
     CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
 
-    // ------------------ Gating: logits = Wgate^T * X ------------------
-    // Wgate: (d x E_total), X: (d x B), logits: (E_total x B) all column-major.
-    const float alpha = 1.0f, beta = 0.0f;
-    CHECK_CUBLAS(cublasSgemm(
-        ctx->cublas,
-        CUBLAS_OP_T, CUBLAS_OP_N,
-        E_total, B, d,
-        &alpha,
-        ctx->Wgate_d, d,
-        ctx->X_d, d,
-        &beta,
-        ctx->logits_d, E_total));
-
-    // softmax + top1 expert per token
-    int threads = 128;
-    softmax_top1_kernel<<<B, threads, 0, ctx->stream>>>(ctx->logits_d, E_total, B, ctx->expert_idx_d);
-    CHECK_CUDA(cudaGetLastError());
-
-    // histogram counts per expert
-    CHECK_CUDA(cudaMemsetAsync(ctx->counts_d, 0, sizeof(int) * E_total, ctx->stream));
-    histogram_experts_kernel<<<(B + 255) / 256, 256, 0, ctx->stream>>>(ctx->expert_idx_d, B, E_total, ctx->counts_d);
-    CHECK_CUDA(cudaGetLastError());
-
-    // copy counts to host
-    ctx->counts_h.assign(E_total, 0);
-    CHECK_CUDA(cudaMemcpyAsync(ctx->counts_h.data(), ctx->counts_d, sizeof(int) * E_total, cudaMemcpyDeviceToHost, ctx->stream));
-    CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
-
-    // offsets (exclusive scan over experts)
-    compute_exclusive_scan(ctx->counts_h, ctx->offsets_h);
-
-    // derive send offsets/counts per rank from expert ranges (contiguous by expert id)
-    ctx->sendCountRank_h.assign(N, 0);
-    ctx->sendOffRank_h.assign(N + 1, 0);
-
-    for (int p = 0; p < N; p++)
+    for (int step = 0; step < ctx->max_tokens; step++)
     {
-        int e0 = p * experts_per_gpu;
-        int e1 = (p + 1) * experts_per_gpu;
-        int start = ctx->offsets_h[e0];
-        int end = ctx->offsets_h[e1];
-        ctx->sendOffRank_h[p] = start;
-        ctx->sendCountRank_h[p] = end - start;
-    }
-    ctx->sendOffRank_h[N] = B;
-
-    // pack tokens grouped by expert
-    CHECK_CUDA(cudaMemcpyAsync(ctx->offsets_d, ctx->offsets_h.data(),
-                               sizeof(int) * (E_total + 1), cudaMemcpyHostToDevice, ctx->stream));
-    CHECK_CUDA(cudaMemsetAsync(ctx->counters_d, 0, sizeof(int) * E_total, ctx->stream));
-
-    pack_by_expert_kernel<<<B, 256, 0, ctx->stream>>>(
-        ctx->X_d, d, B,
-        ctx->expert_idx_d,
-        ctx->offsets_d,
-        ctx->counters_d,
-        ctx->sendAct_d,
-        ctx->sendTok_d,
-        ctx->rank);
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
-
-    // Barrier: all ranks ready before NCCL collectives/pt2pt
-    bar->wait();
-
-    // ------------------ Share per-expert counts via ncclAllGather ------------------
-    // Each rank contributes counts[E_total] -> everyone gets allCounts[N][E_total].
-    CHECK_NCCL(ncclAllGather(ctx->counts_d, ctx->allCounts_d, E_total, ncclInt, ctx->comm, ctx->stream));
-    CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
-
-    ctx->allCounts_h.assign(N * E_total, 0);
-    CHECK_CUDA(cudaMemcpy(ctx->allCounts_h.data(), ctx->allCounts_d, sizeof(int) * N * E_total, cudaMemcpyDeviceToHost));
-
-    // Compute recv counts per sender rank for *my* expert range
-    int my_e0 = ctx->rank * experts_per_gpu;
-    int my_e1 = (ctx->rank + 1) * experts_per_gpu;
-
-    ctx->recvCountRank_h.assign(N, 0);
-    for (int src = 0; src < N; src++)
-    {
-        int sum = 0;
-        const int *row = &ctx->allCounts_h[src * E_total];
-        for (int e = my_e0; e < my_e1; e++)
-            sum += row[e];
-        ctx->recvCountRank_h[src] = sum;
-    }
-
-    // recv offsets by sender (we store chunks in sender-rank order 0..N-1)
-    ctx->recvOffRank_h.resize(N + 1);
-    ctx->recvOffRank_h[0] = 0;
-    for (int i = 0; i < N; i++)
-        ctx->recvOffRank_h[i + 1] = ctx->recvOffRank_h[i] + ctx->recvCountRank_h[i];
-    ctx->total_recv_tokens = ctx->recvOffRank_h[N];
-
-    // Barrier before pt2pt (keeps call ordering tidy)
-    bar->wait();
-
-    // ------------------ NCCL Send/Recv activations + token_ids ------------------
-    // Self "recv" is a device memcpy from my local slice of sendBuf.
-    {
-        int self = ctx->rank;
-
-        int send_off = ctx->sendOffRank_h[self];
-        int send_cnt = ctx->sendCountRank_h[self];
-
-        int recv_off = ctx->recvOffRank_h[self];
-        int recv_cnt = ctx->recvCountRank_h[self];
-
-        // For correctness, these must match:
-        // tokens that route to local experts == tokens we "recv from self"
-        if (send_cnt != recv_cnt)
+        // Slightly perturb X to emulate "next token hidden state changes"
         {
-            // In this demo they should match; if not, it means our layout assumptions were violated.
-            // (They shouldn't be: self range is contiguous in expert order.)
-            std::cerr << "[Rank " << ctx->rank << "] WARNING self send_cnt(" << send_cnt
-                      << ") != self recv_cnt(" << recv_cnt << ")\n";
+            int n = B * d;
+            int threads = 256;
+            int blocks = (n - 1) / threads + 1;
+            float a = 0.999f;
+            float b = 0.0001f * (float)(ctx->rank + 1) * (float)(step + 1);
+            perturb_X<<<blocks, threads, 0, ctx->stream>>>(ctx->X_d, n, a, b);
+            CHECK_CUDA(cudaGetLastError());
         }
 
-        if (send_cnt > 0 && recv_cnt > 0)
+        // ------------------ Gating: logits = Wgate^T * X ------------------
+        // Wgate: (d x E_total), X: (d x B), logits: (E_total x B) all column-major.
+        const float alpha = 1.0f, beta = 0.0f;
+        CHECK_CUBLAS(cublasSgemm(ctx->cublas,
+                                 CUBLAS_OP_T, CUBLAS_OP_N,
+                                 E_total, B, d,
+                                 &alpha,
+                                 ctx->Wgate_d, d,
+                                 ctx->X_d, d,
+                                 &beta,
+                                 ctx->logits_d, E_total));
+
+        // softmax + top1 expert per token
+        int threads = 128;
+        softmax_top1_kernel<<<B, threads, 0, ctx->stream>>>(ctx->logits_d, E_total, B, ctx->expert_idx_d);
+        CHECK_CUDA(cudaGetLastError());
+
+        // histogram counts per expert
+        CHECK_CUDA(cudaMemsetAsync(ctx->counts_d, 0, sizeof(int) * E_total, ctx->stream));
+        histogram_experts_kernel<<<(B + 255) / 256, 256, 0, ctx->stream>>>(ctx->expert_idx_d, B, E_total, ctx->counts_d);
+        CHECK_CUDA(cudaGetLastError());
+
+        // copy counts to host
+        ctx->counts_h.assign(E_total, 0);
+        CHECK_CUDA(cudaMemcpyAsync(ctx->counts_h.data(), ctx->counts_d, sizeof(int) * E_total, cudaMemcpyDeviceToHost, ctx->stream));
+        CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
+
+        // offsets (exclusive scan over experts)
+        compute_exclusive_scan(ctx->counts_h, ctx->offsets_h);
+
+        // derive send offsets/counts per rank from expert ranges (contiguous by expert id)
+        ctx->sendCountRank_h.assign(N, 0);
+        ctx->sendOffRank_h.assign(N + 1, 0);
+
+        for (int p = 0; p < N; p++)
         {
-            CHECK_CUDA(cudaMemcpyAsync(ctx->recvAct_d + (size_t)recv_off * d,
-                                       ctx->sendAct_d + (size_t)send_off * d,
-                                       sizeof(float) * (size_t)std::min(send_cnt, recv_cnt) * d,
-                                       cudaMemcpyDeviceToDevice, ctx->stream));
-            CHECK_CUDA(cudaMemcpyAsync(ctx->recvTok_d + recv_off,
-                                       ctx->sendTok_d + send_off,
-                                       sizeof(int) * (size_t)std::min(send_cnt, recv_cnt),
-                                       cudaMemcpyDeviceToDevice, ctx->stream));
+            int e0 = p * experts_per_gpu;
+            int e1 = (p + 1) * experts_per_gpu;
+            int start = ctx->offsets_h[e0];
+            int end = ctx->offsets_h[e1];
+            ctx->sendOffRank_h[p] = start;
+            ctx->sendCountRank_h[p] = end - start;
         }
-    }
+        ctx->sendOffRank_h[N] = B;
 
-    CHECK_NCCL(ncclGroupStart());
-    for (int peer = 0; peer < N; peer++)
-    {
-        if (peer == ctx->rank)
-            continue;
+        // pack tokens grouped by expert
+        CHECK_CUDA(cudaMemcpyAsync(ctx->offsets_d, ctx->offsets_h.data(),
+                                   sizeof(int) * (E_total + 1), cudaMemcpyHostToDevice, ctx->stream));
+        CHECK_CUDA(cudaMemsetAsync(ctx->counters_d, 0, sizeof(int) * E_total, ctx->stream));
 
-        int send_off = ctx->sendOffRank_h[peer];
-        int send_cnt = ctx->sendCountRank_h[peer];
+        pack_by_expert_kernel<<<B, 256, 0, ctx->stream>>>(
+            ctx->X_d, d, B,
+            ctx->expert_idx_d,
+            ctx->offsets_d,
+            ctx->counters_d,
+            ctx->sendAct_d,
+            ctx->sendTok_d,
+            ctx->rank);
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
 
-        int recv_off = ctx->recvOffRank_h[peer];
-        int recv_cnt = ctx->recvCountRank_h[peer];
+        // Barrier: all ranks ready before NCCL collectives/pt2pt
+        bar->wait();
 
-        if (send_cnt > 0)
+        // ------------------ Share per-expert counts via ncclAllGather ------------------
+        // Each rank contributes counts[E_total] -> everyone gets allCounts[N][E_total].
+        CHECK_NCCL(ncclAllGather(ctx->counts_d, ctx->allCounts_d, E_total, ncclInt, ctx->comm, ctx->stream));
+        CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
+
+        ctx->allCounts_h.assign(N * E_total, 0);
+        CHECK_CUDA(cudaMemcpy(ctx->allCounts_h.data(), ctx->allCounts_d, sizeof(int) * N * E_total, cudaMemcpyDeviceToHost));
+
+        // Compute recv counts per sender rank for *my* expert range
+        int my_e0 = ctx->rank * experts_per_gpu;
+        int my_e1 = (ctx->rank + 1) * experts_per_gpu;
+
+        ctx->recvCountRank_h.assign(N, 0);
+        for (int src = 0; src < N; src++)
         {
-            CHECK_NCCL(ncclSend(ctx->sendAct_d + (size_t)send_off * d,
-                                (size_t)send_cnt * d, ncclFloat,
-                                peer, ctx->comm, ctx->stream));
-            CHECK_NCCL(ncclSend(ctx->sendTok_d + send_off,
-                                send_cnt, ncclInt,
-                                peer, ctx->comm, ctx->stream));
+            int sum = 0;
+            const int *row = &ctx->allCounts_h[src * E_total];
+            for (int e = my_e0; e < my_e1; e++)
+                sum += row[e];
+            ctx->recvCountRank_h[src] = sum;
         }
-        if (recv_cnt > 0)
+
+        // recv offsets by sender (we store chunks in sender-rank order 0..N-1)
+        ctx->recvOffRank_h.resize(N + 1);
+        ctx->recvOffRank_h[0] = 0;
+        for (int i = 0; i < N; i++)
+            ctx->recvOffRank_h[i + 1] = ctx->recvOffRank_h[i] + ctx->recvCountRank_h[i];
+        ctx->total_recv_tokens = ctx->recvOffRank_h[N];
+
+        // Barrier before pt2pt (keeps call ordering tidy)
+        bar->wait();
+
+        // ------------------ NCCL Send/Recv activations + token_ids ------------------
+        // Self "recv" is a device memcpy from my local slice of sendBuf.
         {
-            CHECK_NCCL(ncclRecv(ctx->recvAct_d + (size_t)recv_off * d,
-                                (size_t)recv_cnt * d, ncclFloat,
-                                peer, ctx->comm, ctx->stream));
-            CHECK_NCCL(ncclRecv(ctx->recvTok_d + recv_off,
-                                recv_cnt, ncclInt,
-                                peer, ctx->comm, ctx->stream));
-        }
-    }
-    CHECK_NCCL(ncclGroupEnd());
+            int self = ctx->rank;
 
-    CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
+            int send_off = ctx->sendOffRank_h[self];
+            int send_cnt = ctx->sendCountRank_h[self];
 
-    // ------------------ Expert compute (local experts only) ------------------
-    // recv buffer is partitioned by sender rank. Within each sender chunk, tokens are in *expert order*
-    // for my expert range [my_e0..my_e1). So we can walk experts in order and GEMM each slice.
-    for (int src = 0; src < N; src++)
-    {
-        int base_tok = ctx->recvOffRank_h[src];
-        int offset_in_chunk = 0;
+            int recv_off = ctx->recvOffRank_h[self];
+            int recv_cnt = ctx->recvCountRank_h[self];
 
-        const int *row = &ctx->allCounts_h[src * E_total];
-
-        for (int le = 0; le < experts_per_gpu; le++)
-        {
-            int ge = my_e0 + le;
-            int cnt = row[ge];
-            if (cnt > 0)
+            // For correctness, these must match:
+            // tokens that route to local experts == tokens we "recv from self"
+            if (send_cnt != recv_cnt)
             {
-                float *in = ctx->recvAct_d + (size_t)(base_tok + offset_in_chunk) * d;
-                float *out = ctx->outAct_d + (size_t)(base_tok + offset_in_chunk) * d;
-
-                // out(d x cnt) = Wexp(d x d) * in(d x cnt)
-                CHECK_CUBLAS(cublasSgemm(
-                    ctx->cublas,
-                    CUBLAS_OP_N, CUBLAS_OP_N,
-                    d, cnt, d,
-                    &alpha,
-                    ctx->Wexp_d[le], d,
-                    in, d,
-                    &beta,
-                    out, d));
+                // In this demo they should match; if not, it means our layout assumptions were violated.
+                // (They shouldn't be: self range is contiguous in expert order.)
+                std::cerr << "[Rank " << ctx->rank << "] WARNING self send_cnt(" << send_cnt
+                          << ") != self recv_cnt(" << recv_cnt << ")\n";
             }
-            offset_in_chunk += cnt;
+
+            if (send_cnt > 0 && recv_cnt > 0)
+            {
+                CHECK_CUDA(cudaMemcpyAsync(ctx->recvAct_d + (size_t)recv_off * d,
+                                           ctx->sendAct_d + (size_t)send_off * d,
+                                           sizeof(float) * (size_t)std::min(send_cnt, recv_cnt) * d,
+                                           cudaMemcpyDeviceToDevice, ctx->stream));
+                CHECK_CUDA(cudaMemcpyAsync(ctx->recvTok_d + recv_off,
+                                           ctx->sendTok_d + send_off,
+                                           sizeof(int) * (size_t)std::min(send_cnt, recv_cnt),
+                                           cudaMemcpyDeviceToDevice, ctx->stream));
+            }
         }
+
+        CHECK_NCCL(ncclGroupStart());
+        for (int peer = 0; peer < N; peer++)
+        {
+            if (peer == ctx->rank)
+                continue;
+
+            int send_off = ctx->sendOffRank_h[peer];
+            int send_cnt = ctx->sendCountRank_h[peer];
+
+            int recv_off = ctx->recvOffRank_h[peer];
+            int recv_cnt = ctx->recvCountRank_h[peer];
+
+            if (send_cnt > 0)
+            {
+                CHECK_NCCL(ncclSend(ctx->sendAct_d + (size_t)send_off * d,
+                                    (size_t)send_cnt * d, ncclFloat,
+                                    peer, ctx->comm, ctx->stream));
+                CHECK_NCCL(ncclSend(ctx->sendTok_d + send_off,
+                                    send_cnt, ncclInt,
+                                    peer, ctx->comm, ctx->stream));
+            }
+            if (recv_cnt > 0)
+            {
+                CHECK_NCCL(ncclRecv(ctx->recvAct_d + (size_t)recv_off * d,
+                                    (size_t)recv_cnt * d, ncclFloat,
+                                    peer, ctx->comm, ctx->stream));
+                CHECK_NCCL(ncclRecv(ctx->recvTok_d + recv_off,
+                                    recv_cnt, ncclInt,
+                                    peer, ctx->comm, ctx->stream));
+            }
+        }
+        CHECK_NCCL(ncclGroupEnd());
+
+        CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
+
+        // ------------------ Expert compute (local experts only) ------------------
+        // recv buffer is partitioned by sender rank. Within each sender chunk, tokens are in *expert order*
+        // for my expert range [my_e0..my_e1). So we can walk experts in order and GEMM each slice.
+        for (int src = 0; src < N; src++)
+        {
+            int base_tok = ctx->recvOffRank_h[src];
+            int offset_in_chunk = 0;
+
+            const int *row = &ctx->allCounts_h[src * E_total];
+
+            for (int le = 0; le < experts_per_gpu; le++)
+            {
+                int ge = my_e0 + le;
+                int cnt = row[ge];
+                if (cnt > 0)
+                {
+                    float *in = ctx->recvAct_d + (size_t)(base_tok + offset_in_chunk) * d;
+                    float *out = ctx->outAct_d + (size_t)(base_tok + offset_in_chunk) * d;
+
+                    // out(d x cnt) = Wexp(d x d) * in(d x cnt)
+                    CHECK_CUBLAS(cublasSgemm(
+                        ctx->cublas,
+                        CUBLAS_OP_N, CUBLAS_OP_N,
+                        d, cnt, d,
+                        &alpha,
+                        ctx->Wexp_d[le], d,
+                        in, d,
+                        &beta,
+                        out, d));
+                }
+                offset_in_chunk += cnt;
+            }
+        }
+        CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
+
+        bar->wait();
     }
-    CHECK_CUDA(cudaStreamSynchronize(ctx->stream));
 
     // ------------------ Simple checksum (copy to host and sum) ------------------
     std::vector<float> out_h((size_t)ctx->total_recv_tokens * d);
@@ -548,6 +572,7 @@ int main(int argc, char **argv)
     int experts_per_gpu = get_int_arg(argc, argv, "--experts-per-gpu", 4);
     int B = get_int_arg(argc, argv, "--batch", 32);
     int d = get_int_arg(argc, argv, "--d", 128);
+    int max_tokens = get_int_arg(argc, argv, "--tokens", 100);
 
     int dev_count = 0;
     CHECK_CUDA(cudaGetDeviceCount(&dev_count));
@@ -594,6 +619,7 @@ int main(int argc, char **argv)
         ctxs[r].B = B;
         ctxs[r].d = d;
         ctxs[r].comm = comms[r];
+        ctxs[r].max_tokens = max_tokens;
 
         threads.emplace_back(rank_thread, &ctxs[r], std::cref(Wgate_h), &bar);
     }

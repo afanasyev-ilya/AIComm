@@ -26,11 +26,11 @@
 #define CHECK_CUDA(cmd)                                              \
     do                                                               \
     {                                                                \
-        cudaError_t e = (cmd);                                       \
-        if (e != cudaSuccess)                                        \
+        cudaError_t cuda_error_code = (cmd);                                       \
+        if (cuda_error_code != cudaSuccess)                                        \
         {                                                            \
             std::fprintf(stderr, "CUDA error %s:%d: %s\n",           \
-                         __FILE__, __LINE__, cudaGetErrorString(e)); \
+                         __FILE__, __LINE__, cudaGetErrorString(cuda_error_code)); \
             std::exit(1);                                            \
         }                                                            \
     } while (0)
@@ -38,20 +38,20 @@
 #define CHECK_CUBLAS(cmd)                                    \
     do                                                       \
     {                                                        \
-        cublasStatus_t s = (cmd);                            \
-        if (s != CUBLAS_STATUS_SUCCESS)                      \
+        cublasStatus_t cublas_error_code = (cmd);                            \
+        if (cublas_error_code != CUBLAS_STATUS_SUCCESS)                      \
         {                                                    \
             std::fprintf(stderr, "cuBLAS error %s:%d: %d\n", \
-                         __FILE__, __LINE__, (int)s);        \
+                         __FILE__, __LINE__, (int)cublas_error_code);        \
             std::exit(1);                                    \
         }                                                    \
     } while (0)
 
 #define CHECK_NCCL(cmd) do {                                   \
-  ncclResult_t res = (cmd);                                      \
-  if (res != ncclSuccess) {                                      \
+  ncclResult_t nccl_cmd_err_code = (cmd);                                      \
+  if (nccl_cmd_err_code != ncclSuccess) {                                      \
     std::fprintf(stderr, "NCCL error %s:%d: %s\n",             \
-      __FILE__, __LINE__, ncclGetErrorString(res));              \
+      __FILE__, __LINE__, ncclGetErrorString(nccl_cmd_err_code));              \
     std::exit(1);                                              \
   }                                                            \
 } while(0)
