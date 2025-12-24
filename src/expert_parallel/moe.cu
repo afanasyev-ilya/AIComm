@@ -412,46 +412,9 @@ static void rank_thread(RankCtx *ctx,
         // Barrier before pt2pt (keeps call ordering tidy)
         bar->wait();
 
-        // ------------------ NCCL Send/Recv activations + token_ids ------------------
-        // Self "recv" is a device memcpy from my local slice of sendBuf.
-        {
-            int self = ctx->rank;
-
-            int send_off = ctx->sendOffRank_h[self];
-            int send_cnt = ctx->sendCountRank_h[self];
-
-            int recv_off = ctx->recvOffRank_h[self];
-            int recv_cnt = ctx->recvCountRank_h[self];
-
-            // For correctness, these must match:
-            // tokens that route to local experts == tokens we "recv from self"
-            if (send_cnt != recv_cnt)
-            {
-                // In this demo they should match; if not, it means our layout assumptions were violated.
-                // (They shouldn't be: self range is contiguous in expert order.)
-                std::cerr << "[Rank " << ctx->rank << "] WARNING self send_cnt(" << send_cnt
-                          << ") != self recv_cnt(" << recv_cnt << ")\n";
-            }
-
-            if (send_cnt > 0 && recv_cnt > 0)
-            {
-                CHECK_CUDA(cudaMemcpyAsync(ctx->recvAct_d + (size_t)recv_off * d,
-                                           ctx->sendAct_d + (size_t)send_off * d,
-                                           sizeof(float) * (size_t)std::min(send_cnt, recv_cnt) * d,
-                                           cudaMemcpyDeviceToDevice, ctx->stream));
-                CHECK_CUDA(cudaMemcpyAsync(ctx->recvTok_d + recv_off,
-                                           ctx->sendTok_d + send_off,
-                                           sizeof(int) * (size_t)std::min(send_cnt, recv_cnt),
-                                           cudaMemcpyDeviceToDevice, ctx->stream));
-            }
-        }
-
         CHECK_NCCL(ncclGroupStart());
         for (int peer = 0; peer < N; peer++)
         {
-            if (peer == ctx->rank)
-                continue;
-
             int send_off = ctx->sendOffRank_h[peer];
             int send_cnt = ctx->sendCountRank_h[peer];
 
