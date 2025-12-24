@@ -1,4 +1,4 @@
-#include "common.cuh"
+#include "../common.cuh"
 #include <cuda_profiler_api.h>
 
 using namespace std;

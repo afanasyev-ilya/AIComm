@@ -7,4 +7,5 @@ endfunction()
 
 add_optional_subdir(tensor_parallel)
 add_optional_subdir(pipeline_parallel)
+add_optional_subdir(expert_parallel)
 add_optional_subdir(moe)
